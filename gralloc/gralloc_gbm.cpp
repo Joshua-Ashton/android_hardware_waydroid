@@ -45,6 +45,17 @@
 #include <android/gralloc_handle.h>
 
 #include <unordered_map>
+#include <vector>
+#include <mutex>
+#include <cinttypes>
+
+#define DRM_FORMAT_MOD_VENDOR_NONE    0
+#define DRM_FORMAT_MOD_VENDOR_AMD     0x02
+#define DRM_FORMAT_RESERVED	      ((1ULL << 56) - 1)
+#define fourcc_mod_code(vendor, val) \
+	((((__u64)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
+#define DRM_FORMAT_MOD_INVALID	fourcc_mod_code(NONE, DRM_FORMAT_RESERVED)
+#define DRM_FORMAT_MOD_LINEAR	fourcc_mod_code(NONE, 0)
 
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
@@ -165,9 +176,9 @@ static unsigned int get_pipe_bind(int usage)
 	if (usage & (GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE))
 		bind |= GBM_BO_USE_RENDERING;
 	if (usage & GRALLOC_USAGE_HW_FB)
-		bind |= GBM_BO_USE_RENDERING;
+		bind |= GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT;
 	if (usage & GRALLOC_USAGE_HW_COMPOSER)
-		bind |= GBM_BO_USE_RENDERING;
+		bind |= GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT;
 
 	return bind;
 }
@@ -212,6 +223,77 @@ static struct gbm_bo *gbm_import(struct gbm_device *gbm,
 	return bo;
 }
 
+std::mutex modifier_mutex;
+std::unordered_map<uint32_t, std::vector<uint64_t>> modifier_map;
+bool modifiers_populated = false;
+
+static void populate_modifiers()
+{
+	std::unique_lock lock(modifier_mutex);
+
+	if (modifiers_populated)
+		return;
+
+	modifiers_populated = true;
+
+	ALOGD("[gbm modifiers] Populating modifiers.");
+	int i = 0;
+	for (;;)
+	{
+		char prop_name[PROPERTY_KEY_MAX];
+        snprintf(prop_name, sizeof(prop_name), "gbm.modifiers.%u", i++);
+
+		char prop_value[PROPERTY_VALUE_MAX];
+		if (property_get(prop_name, prop_value, nullptr) < 1)
+			break;
+
+		uint32_t format = 0;
+		uint64_t modifier = 0;
+		if (sscanf(prop_value, "%" PRIx32 ":%" PRIx64, &format, &modifier) != 2)
+			break;
+
+		if (modifier == DRM_FORMAT_MOD_INVALID)
+			continue;
+
+		auto iter = modifier_map.find(format);
+		if (iter == modifier_map.end())
+			iter = modifier_map.emplace(format, std::vector<uint64_t>()).first;
+		iter->second.push_back(modifier);
+
+		ALOGD("[gbm modifiers]   Adding modifier %" PRIx32 ":%" PRIx64 ".", format, modifier);
+	}
+	ALOGD("[gbm modifiers] Populated modifiers.");
+}
+
+static const std::vector<uint64_t> empty_modifiers{};
+static const std::vector<uint64_t> linear_modifiers{ DRM_FORMAT_MOD_LINEAR };
+
+static const std::vector<uint64_t>& get_modifiers(uint32_t format, int usage)
+{
+	populate_modifiers();
+
+	auto iter = modifier_map.find(format);
+	if (iter == modifier_map.end())
+		return empty_modifiers;
+
+	const std::vector<uint64_t>& modifiers = iter->second;
+	if (usage & GBM_BO_USE_LINEAR)
+	{
+		bool has_linear = false;
+		for (uint64_t modifier : modifiers)
+		{
+			if (modifier == DRM_FORMAT_MOD_LINEAR)
+				has_linear = true;
+		}
+
+		return has_linear
+			? linear_modifiers
+			: empty_modifiers;
+	}
+
+	return modifiers;
+}
+
 static struct gbm_bo *gbm_alloc(struct gbm_device *gbm,
 		buffer_handle_t _handle)
 {
@@ -241,7 +323,27 @@ static struct gbm_bo *gbm_alloc(struct gbm_device *gbm,
 
 	ALOGV("create BO, size=%dx%d, fmt=%d, usage=%x",
 	      handle->width, handle->height, handle->format, usage);
-	bo = gbm_bo_create(gbm, width, height, format, usage);
+
+	const uint64_t* modifiers = nullptr;
+	uint32_t modifier_count = 0;
+	if (!!(usage & GBM_BO_USE_SCANOUT) && !(usage & GBM_BO_USE_CURSOR)) {
+		/* Anything presentable should use modifiers advertised by dmabuf
+		 * otherwise it's illegal and can result in broken presentation.
+		 * Vulkan compositors such as Gamescope don't support DRM_FORMAT_MOD_INVALID
+		 * for presentation as it relies on matching against GL driver.
+		 */
+		const auto& format_modifiers = get_modifiers(format, usage);
+
+		if (!format_modifiers.empty())
+		{
+			modifiers = format_modifiers.data();
+			modifier_count = uint32_t(format_modifiers.size());
+
+			usage &= ~GBM_BO_USE_LINEAR; /* Handled by modifiers. */
+		}
+	}
+
+	bo = gbm_bo_create_with_modifiers2(gbm, width, height, format, modifiers, modifier_count, usage);
 	if (!bo) {
 		ALOGE("failed to create BO, size=%dx%d, fmt=%d, usage=%x",
 		      handle->width, handle->height, handle->format, usage);
