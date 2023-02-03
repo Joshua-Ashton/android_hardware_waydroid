@@ -96,6 +96,11 @@ struct handleExt {
 
 struct window;
 
+struct wl_modifier_format {
+    uint32_t format;
+    uint64_t modifier;
+};
+
 struct display {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -148,7 +153,7 @@ struct display {
     int full_width;
     int full_height;
     int refresh;
-    uint32_t *formats;
+    wl_modifier_format *formats;
     int formats_count;
     bool geo_changed;
     std::map<uint32_t, std::string> layer_names;

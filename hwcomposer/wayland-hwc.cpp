@@ -50,6 +50,7 @@
 #include <syscall.h>
 #include <cmath>
 #include <algorithm>
+#include <cinttypes>
 
 #include <libsync/sw_sync.h>
 #include <sync/sync.h>
@@ -156,7 +157,7 @@ static const struct zwp_linux_buffer_params_v1_listener params_listener = {
 
 bool isFormatSupported(struct display *display, uint32_t format) {
     for (int i = 0; i < display->formats_count; i++) {
-        if (format == display->formats[i])
+        if (format == display->formats[i].format)
             return true;
     }
     return false;
@@ -1185,25 +1186,24 @@ static const struct wl_seat_listener seat_listener = {
 
 static void
 dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 *,
-         uint32_t format, uint32_t, uint32_t)
+         uint32_t format, uint32_t modifier_hi, uint32_t modifier_lo)
 {
     struct display *d = (struct display*)data;
+    uint64_t modifier = ((uint64_t) modifier_hi << 32) | modifier_lo;
 
     ++d->formats_count;
-    d->formats = (uint32_t*)realloc(d->formats,
+    d->formats = (wl_modifier_format*)realloc(d->formats,
                     d->formats_count * sizeof(*d->formats));
-    d->formats[d->formats_count - 1] = format;
+
+    d->formats[d->formats_count - 1].format = format;
+    d->formats[d->formats_count - 1].modifier = modifier;
 }
 
 static void
-dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *, uint32_t format)
+dmabuf_format(void *, struct zwp_linux_dmabuf_v1 *, uint32_t)
 {
-    struct display *d = (struct display*)data;
-
-    ++d->formats_count;
-    d->formats = (uint32_t*)realloc(d->formats,
-                    d->formats_count * sizeof(*d->formats));
-    d->formats[d->formats_count - 1] = format;
+   /* Formats are implicitly advertised by the modifier event, so we ignore
+    * them here. */
 }
 
 static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
@@ -1711,6 +1711,7 @@ registry_handle_global(void *data, struct wl_registry *registry,
         d->dmabuf = (struct zwp_linux_dmabuf_v1*)wl_registry_bind(registry, id,
                 &zwp_linux_dmabuf_v1_interface, 3);
         zwp_linux_dmabuf_v1_add_listener(d->dmabuf, &dmabuf_listener, d);
+        wl_display_roundtrip(d->display);
     } else if (strcmp(interface, "zwp_tablet_manager_v2") == 0) {
         d->tablet_manager = (struct zwp_tablet_manager_v2 *)wl_registry_bind(registry, id,
                 &zwp_tablet_manager_v2_interface, 1);
@@ -1773,6 +1774,20 @@ create_display(const char *gralloc)
     wl_registry_add_listener(display->registry,
                  &registry_listener, display);
     wl_display_roundtrip(display->display);
+    wl_display_roundtrip(display->display);
+
+    ALOGD("[hwcomposer modifiers] Setting modifier properties...");
+    for (int i = 0; i < display->formats_count; i++) {
+        char prop_name[PROPERTY_KEY_MAX];
+        snprintf(prop_name, sizeof(prop_name), "gbm.modifiers.%u", i);
+
+        char prop_value[PROPERTY_VALUE_MAX];
+        snprintf(prop_value, sizeof(prop_value), "%" PRIx32 ":%" PRIx64, display->formats[i].format, display->formats[i].modifier);
+
+        property_set(prop_name, prop_value);
+        ALOGD("[hwcomposer modifiers]   Setting modifier property '%s': '%s'.", prop_name, prop_value);
+    }
+    ALOGD("[hwcomposer modifiers] Set modifier properties.");
 
     display->task = IWaydroidTask::getService();
     return display;
